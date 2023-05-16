@@ -23,13 +23,13 @@ type Client struct {
 }
 
 type Channel struct {
-	ConnID      int
-	ChaID       int
-	Cha         *amqp.Channel
-	ConfirmChan chan amqp.Confirmation //确保消费
-	PublishChan chan amqp.Confirmation //确保接收
-	CloseChan   chan *amqp.Error       //channel关闭通知
-
+	ConnID       int
+	ChaID        int
+	Cha          *amqp.Channel
+	ConfirmChan  chan amqp.Confirmation //确保消费
+	PublishChan  chan amqp.Confirmation //确保接收
+	CloseChan    chan *amqp.Error       //channel关闭通知
+	TimeoutTimer *time.Timer            //超时
 }
 
 func NewClient(amqpURL string, chanSize int, connRetryTimes int) (*Client, error) {
@@ -135,7 +135,7 @@ func (c *Client) InitChannel(size int) error {
 
 		channel.CloseChan = cha.NotifyClose(make(chan *amqp.Error, 1))
 		channel.PublishChan = cha.NotifyPublish(make(chan amqp.Confirmation, 1))
-
+		channel.TimeoutTimer = time.NewTimer(2 * time.Second)
 		c.CChan <- channel
 	}
 	return nil
@@ -144,7 +144,7 @@ func (c *Client) InitChannel(size int) error {
 /**
  * exchangeType  string  "direct", "fanout", "topic" and  "headers"
  */
-func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string, msgId string, b []byte) error {
+func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string, msgId string, b []byte, header map[string]interface{}) error {
 
 	for {
 
@@ -164,6 +164,7 @@ func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string
 				false, //不保证能将信息分配到queue
 				false, //不保证queue有消费者
 				amqp.Publishing{
+					Headers:      amqp.Table(header),
 					MessageId:    msgId,
 					DeliveryMode: amqp.Persistent,
 					ContentType:  "text/plain",
@@ -189,7 +190,7 @@ func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string
 				log.Println("PublishToExchange channel closed.", channel.ConnID, channel.ChaID, string(b))
 				c.ReConnChan <- channel
 				continue
-			case <-time.After(2 * time.Second):
+			case <-channel.TimeoutTimer.C:
 				c.ReConnChan <- channel
 				log.Println("PublishToExchange confirm timeout.", channel.ConnID, channel.ChaID, string(b))
 			}
@@ -201,7 +202,7 @@ func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string
 /**
  *
  */
-func (c *Client) Consume(consumeId string, queueName string, f func([]byte) error) {
+func (c *Client) Consume(consumeId string, queueName string, f func(amqp.Delivery) error) {
 	for {
 
 		if !c.ConnStatus {
@@ -246,8 +247,8 @@ func (c *Client) Consume(consumeId string, queueName string, f func([]byte) erro
 					log.Println("Consume channel closed", channel.ConnID, channel.ChaID)
 					shouldBreak = true
 				case d := <-m:
-					err := f(d.Body)
-					log.Println("Consume receive message", string(d.Body), err)
+					err := f(d)
+					log.Println("Consume receive message", string(d.MessageId), err)
 					if err != nil {
 						_ = d.Reject(true)
 					} else {

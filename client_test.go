@@ -1,13 +1,13 @@
 package gormq
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"testing"
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/streadway/amqp"
 )
 
 func TestPublish(t *testing.T) {
@@ -23,7 +23,7 @@ func TestPublish(t *testing.T) {
 		go func(i int) {
 			UUID, _ := uuid.NewV4()
 			msgId := UUID.String()
-			err := client.PublishToExchange("amq.direct", "direct", "r.amq.direct", msgId, []byte(fmt.Sprintf("hello world,%d", i)))
+			err := client.PublishToExchange("amq.direct", "direct", "r.amq.direct", msgId, []byte(fmt.Sprintf("hello world,%d", i)), map[string]interface{}{})
 
 			if err != nil {
 				log.Printf("PublishToExchange error %s", err)
@@ -69,11 +69,11 @@ func TestConsume(t *testing.T) {
 		}
 	}(client)
 
-	client.Consume("111111", `q.amq.direct`, func(b []byte) error {
-		msg := string(b)
-		log.Println("receive msg:", msg)
-		time.Sleep(time.Second)
-		return errors.New("debug 测试")
+	client.Consume("111111", `q.amq.direct`, func(msg amqp.Delivery) error {
+		body := string(msg.Body)
+		log.Println("receive msg:", msg.MessageId, body)
+		time.Sleep(100 * time.Microsecond)
+		return nil
 	})
 
 }
@@ -100,7 +100,7 @@ func TestPublishAndConsume(t *testing.T) {
 			UUID, _ := uuid.NewV4()
 			msgId := UUID.String()
 			msg := fmt.Sprintf("hello world,%d", i)
-			err := client.PublishToExchange("amq.direct", "direct", "r.amq.direct", msgId, []byte(msg))
+			err := client.PublishToExchange("amq.direct", "direct", "r.amq.direct", msgId, []byte(msg), map[string]interface{}{})
 
 			if err != nil {
 				log.Printf("PublishToExchange error %s", err)
@@ -113,9 +113,9 @@ func TestPublishAndConsume(t *testing.T) {
 		}
 	}()
 
-	client.Consume("111111", `q.amq.direct`, func(b []byte) error {
-		msg := string(b)
-		log.Println("receive msg:", msg)
+	client.Consume("111111", `q.amq.direct`, func(msg amqp.Delivery) error {
+		body := string(msg.Body)
+		log.Println("receive msg:", msg.MessageId, body)
 		time.Sleep(100 * time.Microsecond)
 		return nil
 	})
