@@ -15,7 +15,7 @@ type Client struct {
 	ConnRetryTimes int
 	ChanSize       int
 	CChan          chan *Channel
-	ReConnChan     chan int //失败重连队列
+	ReConnChan     chan *Channel //失败重连队列
 	m              *sync.Mutex
 	ConnStatus     bool               //链接状态
 	CloseChan      chan *amqp.Error   //conn关闭通知
@@ -24,7 +24,7 @@ type Client struct {
 
 type Channel struct {
 	ConnID      int
-	ChaId       int
+	ChaID       int
 	Cha         *amqp.Channel
 	ConfirmChan chan amqp.Confirmation //确保消费
 	PublishChan chan amqp.Confirmation //确保接收
@@ -40,7 +40,7 @@ func NewClient(amqpURL string, chanSize int, connRetryTimes int) (*Client, error
 		m:              new(sync.Mutex),
 		ChanSize:       chanSize,
 		ConnID:         0,
-		ReConnChan:     make(chan int),
+		ReConnChan:     make(chan *Channel),
 		ConnStatus:     false,
 	}
 
@@ -49,12 +49,15 @@ func NewClient(amqpURL string, chanSize int, connRetryTimes int) (*Client, error
 	go func(c *Client) {
 		for {
 			select {
-			case connId := <-c.ReConnChan:
-				log.Println("收到重连消息，判断是否需要重连", connId, c.ConnID)
-				if c.ConnID == connId {
+			case channel := <-c.ReConnChan:
+				log.Println("Receive reconn event", channel.ConnID, c.ConnID)
+				if c.ConnID == channel.ConnID {
+					c.Close()
 					if err := c.Init(); err != nil {
-						log.Print("重连出现异常", err)
+						log.Print("reconn Fail.", err)
 						c.ConnStatus = false
+					} else {
+						log.Print("reconn Success.")
 					}
 				}
 			}
@@ -72,7 +75,7 @@ func (c *Client) Init() error {
 		if err := c.Connect(); err != nil {
 			t = 1
 			time.Sleep(time.Second)
-			log.Printf("Connect %s error %s, will retry", c.AmqpUrl, err.Error())
+			log.Printf("Init Connect %s error %s, will retry", c.AmqpUrl, err.Error())
 
 			if t < c.ConnRetryTimes {
 				continue
@@ -81,15 +84,9 @@ func (c *Client) Init() error {
 			}
 		}
 
-		c.ConnID += 1
-		c.ConnStatus = true
-
-		c.CloseChan = c.Conn.NotifyClose(make(chan *amqp.Error))
-		c.BlockChan = c.Conn.NotifyBlocked(make(chan amqp.Blocking))
-
 		//链接成功后，初始化channel
 		if err := c.InitChannel(c.ChanSize); err != nil {
-			log.Printf("GetChannel %s error %s", c.AmqpUrl, err.Error())
+			log.Printf("Init GetChannel %s error %s", c.AmqpUrl, err.Error())
 			return err
 		}
 		return nil
@@ -101,11 +98,20 @@ func (c *Client) Connect() (err error) {
 	c.m.Lock()
 	defer c.m.Unlock()
 	c.Conn, err = amqp.Dial(c.AmqpUrl)
+
+	if err == nil {
+		c.ConnID += 1
+		c.ConnStatus = true
+		c.CloseChan = c.Conn.NotifyClose(make(chan *amqp.Error))
+		c.BlockChan = c.Conn.NotifyBlocked(make(chan amqp.Blocking))
+	}
+
 	return err
 }
 
 // close
 func (c *Client) Close() error {
+	log.Println("Client::Close", c.ConnID)
 	return c.Conn.Close()
 }
 
@@ -122,17 +128,13 @@ func (c *Client) InitChannel(size int) error {
 		}
 
 		channel := &Channel{
-			ConnID:      c.ConnID,
-			ChaId:       c.ConnID*100 + i,
-			Cha:         cha,
-			ConfirmChan: make(chan amqp.Confirmation, 1),
-			PublishChan: make(chan amqp.Confirmation, 1),
-			CloseChan:   make(chan *amqp.Error, 1),
+			ConnID: c.ConnID,
+			ChaID:  c.ConnID*100 + i,
+			Cha:    cha,
 		}
 
-		cha.NotifyClose(channel.CloseChan)
-
-		cha.NotifyPublish(channel.PublishChan)
+		channel.CloseChan = cha.NotifyClose(make(chan *amqp.Error, 1))
+		channel.PublishChan = cha.NotifyPublish(make(chan amqp.Confirmation, 1))
 
 		c.CChan <- channel
 	}
@@ -143,15 +145,17 @@ func (c *Client) InitChannel(size int) error {
  * exchangeType  string  "direct", "fanout", "topic" and  "headers"
  */
 func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string, msgId string, b []byte) error {
-	if !c.ConnStatus {
-		log.Println("链接状态异常", exchangeName, exchangeType, routingKey, msgId, string(b))
-		return nil
-	}
+
 	for {
+
+		if !c.ConnStatus {
+			log.Println("PublishToExchange conn ConnStatus invalid:", exchangeName, exchangeType, routingKey, msgId, string(b))
+			return nil
+		}
+
 		select {
 		case channel := <-c.CChan:
 			if !c.IsParentConn(channel) {
-				//抛弃非当前链接的channel
 				continue
 			}
 			err := channel.Cha.Publish(
@@ -166,34 +170,28 @@ func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string
 					Body:         b,
 				})
 			if err != nil {
-				log.Println("--- failed to publish to queue, trying to resend ---", channel.ConnID, channel.ChaId, string(b))
-				c.ReConnChan <- channel.ConnID
-				// 更换重试
+				log.Println("PublishToExchange Fail.", channel.ConnID, channel.ChaID, string(b))
+				c.ReConnChan <- channel
 				continue
 			}
-			log.Printf("--- published to exchange '%s',msg:'%s' %d %d ---\r\n", routingKey, string(b), channel.ConnID, channel.ChaId)
+			log.Println("PublishToExchange Success.", channel.ConnID, channel.ChaID, string(b))
 
-			// 交换机确认接受 NotifyPublic
-			// 确认信息发送到 NotifyConfirm
-
-			//channel关闭
 			select {
 			case confirm := <-channel.PublishChan:
-				log.Printf("收到确认通知%v %d %d %s", confirm, channel.ConnID, channel.ChaId, string(b))
+				log.Println("PublishToExchange receive confirm.", channel.ConnID, channel.ChaID, string(b), confirm.Ack)
 				if !confirm.Ack {
-					c.ReConnChan <- channel.ConnID
+					c.ReConnChan <- channel
 					continue
 				} else {
 					c.CChan <- channel
 				}
 			case <-channel.CloseChan:
-				log.Println("收到信道关闭的通知 channel.CloseChan", channel.ConnID, channel.ChaId, string(b))
-				c.ReConnChan <- channel.ConnID
+				log.Println("PublishToExchange channel closed.", channel.ConnID, channel.ChaID, string(b))
+				c.ReConnChan <- channel
 				continue
 			case <-time.After(2 * time.Second):
-				c.ReConnChan <- channel.ConnID
-
-				log.Println("接受确认信息超时", channel.ConnID, channel.ChaId, string(b))
+				c.ReConnChan <- channel
+				log.Println("PublishToExchange confirm timeout.", channel.ConnID, channel.ChaID, string(b))
 			}
 			return nil
 		}
@@ -204,14 +202,18 @@ func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string
  *
  */
 func (c *Client) Consume(consumeId string, queueName string, f func([]byte) error) {
-	if !c.ConnStatus {
-		log.Println("conn状态异常，无法监听队列", queueName)
-		return
-	}
-
 	for {
+
+		if !c.ConnStatus {
+			log.Println("Consume conn ConnStatus invalid:", queueName)
+			return
+		}
+
 		select {
 		case channel := <-c.CChan:
+			if !c.IsParentConn(channel) {
+				continue
+			}
 			m, err := channel.Cha.Consume(
 				queueName,
 				consumeId,
@@ -222,31 +224,30 @@ func (c *Client) Consume(consumeId string, queueName string, f func([]byte) erro
 				nil,
 			)
 			if err != nil {
-				log.Println("--- failed to consume from queue, trying again ---")
-				c.ReConnChan <- channel.ConnID
+				log.Println("Consume Fail", channel.ConnID, channel.ChaID)
+				c.ReConnChan <- channel
 				continue
 			}
 
 			shouldBreak := false
 			for {
 				if shouldBreak {
-					c.ReConnChan <- channel.ConnID
+					c.ReConnChan <- channel
 					break
 				}
 				select {
 				case <-c.BlockChan:
-					log.Println("--- connection blocked ---")
+					log.Println("Consume connection blocked", channel.ConnID, channel.ChaID)
 					shouldBreak = true
 				case <-c.CloseChan:
-					log.Println("--- connection closed ---")
+					log.Println("Consume connection closed", channel.ConnID, channel.ChaID)
 					shouldBreak = true
-
 				case <-channel.CloseChan:
-					log.Println("--- channel closed ---")
+					log.Println("Consume channel closed", channel.ConnID, channel.ChaID)
 					shouldBreak = true
 				case d := <-m:
 					err := f(d.Body)
-					log.Println("消费，返回值", string(d.Body), err)
+					log.Println("Consume receive message", string(d.Body), err)
 					if err != nil {
 						_ = d.Reject(true)
 					} else {

@@ -77,3 +77,47 @@ func TestConsume(t *testing.T) {
 	})
 
 }
+
+func TestPublishAndConsume(t *testing.T) {
+	client, err := NewClient(`amqp://admin:admin@127.0.0.1:5672/`, 3, 3)
+
+	if err != nil {
+		panic(err)
+	}
+
+	defer client.Close()
+
+	// go func(c *Client) {
+	// 	for {
+	// 		time.Sleep(5 * time.Second)
+	// 		log.Println("手动关闭链接")
+	// 		client.Close()
+	// 	}
+	// }(client)
+
+	go func() {
+		for i := 1; i <= 30; i++ {
+			UUID, _ := uuid.NewV4()
+			msgId := UUID.String()
+			msg := fmt.Sprintf("hello world,%d", i)
+			err := client.PublishToExchange("amq.direct", "direct", "r.amq.direct", msgId, []byte(msg))
+
+			if err != nil {
+				log.Printf("PublishToExchange error %s", err)
+			}
+			log.Println("publish msg:", msg)
+			// if i%5 == 0 {
+			// 	client.Close()
+			// }
+			// time.Sleep(time.Second)
+		}
+	}()
+
+	client.Consume("111111", `q.amq.direct`, func(b []byte) error {
+		msg := string(b)
+		log.Println("receive msg:", msg)
+		time.Sleep(100 * time.Microsecond)
+		return nil
+	})
+
+}
