@@ -1,4 +1,4 @@
-module go-rmq-client
+module gormq
 
 go 1.20
 
