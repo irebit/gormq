@@ -23,13 +23,14 @@ type Client struct {
 }
 
 type Channel struct {
-	ConnID       int
-	ChaID        int
-	Cha          *amqp.Channel
-	ConfirmChan  chan amqp.Confirmation //确保消费
-	PublishChan  chan amqp.Confirmation //确保接收
-	CloseChan    chan *amqp.Error       //channel关闭通知
-	TimeoutTimer *time.Timer            //超时
+	ConnID         int
+	ChaID          int
+	Cha            *amqp.Channel
+	ConfirmChan    chan amqp.Confirmation //确保消费
+	PublishChan    chan amqp.Confirmation //确保接收
+	CloseChan      chan *amqp.Error       //channel关闭通知
+	ChannelTimeout int64                  //超时未确认
+	TimeoutTimer   *time.Timer            //超时
 }
 
 func NewClient(amqpURL string, chanSize int, connRetryTimes int) (*Client, error) {
@@ -128,14 +129,15 @@ func (c *Client) InitChannel(size int) error {
 		}
 
 		channel := &Channel{
-			ConnID: c.ConnID,
-			ChaID:  c.ConnID*100 + i,
-			Cha:    cha,
+			ConnID:         c.ConnID,
+			ChaID:          c.ConnID*100 + i,
+			Cha:            cha,
+			ChannelTimeout: 2,
 		}
 
 		channel.CloseChan = cha.NotifyClose(make(chan *amqp.Error, 1))
 		channel.PublishChan = cha.NotifyPublish(make(chan amqp.Confirmation, 1))
-		channel.TimeoutTimer = time.NewTimer(2 * time.Second)
+		channel.TimeoutTimer = time.NewTimer(time.Duration(channel.ChannelTimeout) * time.Second)
 		c.CChan <- channel
 	}
 	return nil
@@ -155,6 +157,7 @@ func (c *Client) PublishToExchange(exchangeName, exchangeType, routingKey string
 
 		select {
 		case channel := <-c.CChan:
+			channel.TimeoutTimer.Reset(time.Duration(channel.ChannelTimeout) * time.Second)
 			if !c.IsParentConn(channel) {
 				continue
 			}

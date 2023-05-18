@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofrs/uuid"
+	uuid "github.com/satori/go.uuid"
 	"github.com/streadway/amqp"
 )
 
@@ -21,8 +21,7 @@ func TestPublish(t *testing.T) {
 
 	for i := 1; i <= 20; i++ {
 		go func(i int) {
-			UUID, _ := uuid.NewV4()
-			msgId := UUID.String()
+			msgId := uuid.NewV4().String()
 			err := client.PublishToExchange("amq.direct", "direct", "r.amq.direct", msgId, []byte(fmt.Sprintf("hello world,%d", i)), map[string]interface{}{})
 
 			if err != nil {
@@ -87,18 +86,18 @@ func TestPublishAndConsume(t *testing.T) {
 
 	defer client.Close()
 
-	// go func(c *Client) {
-	// 	for {
-	// 		time.Sleep(5 * time.Second)
-	// 		log.Println("手动关闭链接")
-	// 		client.Close()
-	// 	}
-	// }(client)
+	go func(c *Client) {
+		for {
+			time.Sleep(5 * time.Second)
+			log.Println("手动关闭链接")
+			client.Close()
+		}
+	}(client)
 
 	go func() {
 		for i := 1; i <= 30; i++ {
-			UUID, _ := uuid.NewV4()
-			msgId := UUID.String()
+			msgId := uuid.NewV4().String()
+
 			msg := fmt.Sprintf("hello world,%d", i)
 			err := client.PublishToExchange("amq.direct", "direct", "r.amq.direct", msgId, []byte(msg), map[string]interface{}{})
 
